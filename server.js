@@ -300,11 +300,18 @@ app.post("/payos-webhook", async (req, res) => {
       return res.status(200).json({ success: true, message: "Webhook received" });
     }
 
-    const { orderCode, amount } = webhookData;
+    const orderCode = webhookData?.data?.orderCode;
+    const amount = webhookData?.data?.amount;
+
+    if (!orderCode) {
+      console.log("Không có orderCode trong webhook");
+      return res.status(200).json({ success: true });
+    }
 
     const topup = await db.collection("topup_requests").findOne({ orderCode });
 
     if (!topup) {
+      console.log("Không tìm thấy topup với orderCode:", orderCode);
       return res.status(200).json({ success: true });
     }
 
@@ -315,11 +322,13 @@ app.post("/payos-webhook", async (req, res) => {
     const user = await db.collection("users").findOne({ _id: topup.userId });
 
     if (!user) {
+      console.log("Không tìm thấy user:", topup.userId);
       return res.status(200).json({ success: true });
     }
 
+    const paidAmount = Number(amount || topup.amount);
     const balanceBefore = Number(user.balance || 0);
-    const balanceAfter = balanceBefore + Number(amount || topup.amount);
+    const balanceAfter = balanceBefore + paidAmount;
 
     await db.collection("users").updateOne(
       { _id: topup.userId },
@@ -332,7 +341,7 @@ app.post("/payos-webhook", async (req, res) => {
         $set: {
           status: "paid",
           paidAt: new Date(),
-          paidAmount: Number(amount || topup.amount)
+          paidAmount
         }
       }
     );
@@ -340,7 +349,7 @@ app.post("/payos-webhook", async (req, res) => {
     await db.collection("transactions").insertOne({
       userId: topup.userId,
       type: "topup",
-      amount: Number(amount || topup.amount),
+      amount: paidAmount,
       balanceBefore,
       balanceAfter,
       note: `Nạp tiền payOS - ${topup.transferCode}`,
