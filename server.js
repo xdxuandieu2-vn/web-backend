@@ -300,13 +300,17 @@ app.post("/payos-webhook", async (req, res) => {
       return res.status(200).json({ success: true, message: "Webhook received" });
     }
 
-    const orderCode = webhookData?.data?.orderCode;
-    const amount = webhookData?.data?.amount;
+   const payload = webhookData?.data ? webhookData.data : webhookData;
+const orderCode = payload?.orderCode;
+const amount = payload?.amount;
 
-    if (!orderCode) {
-      console.log("Không có orderCode trong webhook");
-      return res.status(200).json({ success: true });
-    }
+console.log("webhookData sau verify:", webhookData);
+console.log("payload dùng để xử lý:", payload);
+
+if (!orderCode) {
+  console.log("Không có orderCode trong webhook");
+  return res.status(200).json({ success: true });
+}
 
     const topup = await db.collection("topup_requests").findOne({ orderCode });
 
