@@ -284,7 +284,9 @@ app.post("/topup/create", authMiddleware, async (req, res) => {
     res.status(500).json({ message: "Lỗi server" });
   }
 });
-
+app.get("/payos-webhook", (req, res) => {
+  res.status(200).send("payOS webhook endpoint is running");
+});
 app.post("/payos-webhook", async (req, res) => {
   try {
     console.log("payOS webhook body:", req.body);
