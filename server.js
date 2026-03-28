@@ -294,7 +294,7 @@ app.post("/payos-webhook", async (req, res) => {
     let webhookData = null;
 
     try {
-      webhookData = payOS.webhooks.verify(req.body);
+      webhookData = await payOS.webhooks.verify(req.body);
     } catch (verifyError) {
       console.log("Webhook verify fail:", verifyError.message);
       return res.status(200).json({ success: true, message: "Webhook received" });
