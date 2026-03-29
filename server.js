@@ -430,9 +430,16 @@ if (!orderCode) {
     return res.status(200).json({ success: true });
   }
 });
-// ===================== Thêm webhook payOS để tự cộng tiền//
+// ===================== hàm ẩn dữ liệu mật//
 
+function sanitizeProduct(product) {
+  if (!product) return product;
 
+  const safeProduct = { ...product };
+  delete safeProduct.delivery;
+
+  return safeProduct;
+}
 // ===================== PRODUCTS =====================
 
 // lấy tất cả sản phẩm
@@ -444,13 +451,14 @@ app.get("/products", async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.json(products);
+    const safeProducts = products.map(sanitizeProduct);
+
+    res.json(safeProducts);
   } catch (error) {
     console.error("Lỗi /products:", error.message);
     res.status(500).json({ message: "Lỗi lấy danh sách sản phẩm" });
   }
 });
-
 // lấy chi tiết 1 sản phẩm theo slug
 app.get("/products/:slug", async (req, res) => {
   try {
@@ -462,27 +470,42 @@ app.get("/products/:slug", async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy sản phẩm" });
     }
 
-    res.json(product);
+    res.json(sanitizeProduct(product));
   } catch (error) {
     console.error("Lỗi /products/:slug:", error.message);
     res.status(500).json({ message: "Lỗi lấy chi tiết sản phẩm" });
   }
 });
+//----lay danh sach san pham cho admin---//
+app.get("/admin/products", adminMiddleware, async (req, res) => {
+  try {
+    const products = await db
+      .collection("products")
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
 
+    res.json(products);
+  } catch (error) {
+    console.error("Lỗi /admin/products:", error.message);
+    res.status(500).json({ message: "Lỗi lấy danh sách sản phẩm admin" });
+  }
+});
 // thêm sản phẩm
 app.post("/products", adminMiddleware, async (req, res) => {
   try {
     const {
-      slug,
-      title,
-      follow,
-      desc,
-      tags,
-      price,
-      image,
-      status,
-      detail
-    } = req.body;
+  slug,
+  title,
+  follow,
+  desc,
+  tags,
+  price,
+  image,
+  status,
+  detail,
+  delivery
+} = req.body;
 
     if (!slug || !title || !price || !image) {
       return res.status(400).json({ message: "Thiếu dữ liệu sản phẩm" });
@@ -504,6 +527,7 @@ app.post("/products", adminMiddleware, async (req, res) => {
       image, // ví dụ: "images/anh2.jpg"
       status: status || "available", // available | sold
       detail: detail || {},
+      delivery: delivery || {},
       createdAt: new Date()
     };
 
@@ -697,21 +721,21 @@ app.post("/purchase/:id", authMiddleware, async (req, res) => {
     });
 
     await db.collection("orders").insertOne({
-      userId: new ObjectId(req.user.userId),
-      username: user.username,
-      productId: product._id,
-      productTitle: product.title,
-      productPrice: price,
-      deliveryInfo: {
-        username: product.detail?.username || "",
-        category: product.detail?.category || "",
-        livestream: !!product.detail?.livestream,
-        shopEnabled: !!product.detail?.shopEnabled,
-        note: product.detail?.note || ""
-      },
-      status: "completed",
-      createdAt: new Date()
-    });
+  userId: new ObjectId(req.user.userId),
+  username: user.username,
+  productId: product._id,
+  productTitle: product.title,
+  productPrice: price,
+  deliveryInfo: {
+    loginAccount: product.delivery?.loginAccount || "",
+    loginPassword: product.delivery?.loginPassword || "",
+    recoveryEmail: product.delivery?.recoveryEmail || "",
+    twoFA: product.delivery?.twoFA || "",
+    note: product.delivery?.note || ""
+  },
+  status: "completed",
+  createdAt: new Date()
+});
 
     return res.json({
       message: "Mua sản phẩm thành công",
@@ -728,16 +752,73 @@ app.post("/purchase/:id", authMiddleware, async (req, res) => {
         balanceAfter
       },
       deliveryInfo: {
-        username: product.detail?.username || "Chưa cập nhật",
-        category: product.detail?.category || "Chưa cập nhật",
-        livestream: !!product.detail?.livestream,
-        shopEnabled: !!product.detail?.shopEnabled,
-        note: product.detail?.note || "Không có ghi chú"
-      }
+  loginAccount: product.delivery?.loginAccount || "Chưa cập nhật",
+  loginPassword: product.delivery?.loginPassword || "Chưa cập nhật",
+  recoveryEmail: product.delivery?.recoveryEmail || "Chưa cập nhật",
+  twoFA: product.delivery?.twoFA || "Chưa cập nhật",
+  note: product.delivery?.note || "Không có ghi chú"
+}
     });
   } catch (error) {
     console.error("Lỗi /purchase/:id:", error.message);
     return res.status(500).json({ message: "Lỗi xử lý mua sản phẩm" });
+  }
+});
+//======================đơn hàng đã mua=================//
+app.get("/my-orders", authMiddleware, async (req, res) => {
+  try {
+    const userId = new ObjectId(req.user.userId);
+
+    const orders = await db.collection("orders")
+      .find(
+        { userId },
+        {
+          projection: {
+            productTitle: 1,
+            productPrice: 1,
+            status: 1,
+            createdAt: 1
+          }
+        }
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(orders);
+  } catch (error) {
+    console.error("Lỗi /my-orders:", error.message);
+    res.status(500).json({ message: "Lỗi lấy danh sách đơn hàng" });
+  }
+});
+//---lấy chi tiết 1 đơn hàng //
+app.get("/my-orders/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "ID đơn hàng không hợp lệ" });
+    }
+
+    const order = await db.collection("orders").findOne({
+      _id: new ObjectId(id),
+      userId: new ObjectId(req.user.userId)
+    });
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
+
+    res.json({
+      _id: order._id,
+      productTitle: order.productTitle,
+      productPrice: order.productPrice,
+      status: order.status,
+      createdAt: order.createdAt,
+      deliveryInfo: order.deliveryInfo || {}
+    });
+  } catch (error) {
+    console.error("Lỗi /my-orders/:id:", error.message);
+    res.status(500).json({ message: "Lỗi lấy chi tiết đơn hàng" });
   }
 });
 // ===================== RUN SERVER =====================
