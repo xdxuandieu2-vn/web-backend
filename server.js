@@ -63,31 +63,54 @@ app.post("/register", async (req, res) => {
     const { username, email, password } = req.body;
 
     if (!username || !email || !password) {
-      return res.status(400).json({ message: "Vui lòng nhập đầy đủ thông tin" });
+      return res.status(400).json({
+        field: "general",
+        message: "Vui lòng nhập đầy đủ thông tin"
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        field: "email",
+        message: "Email không đúng định dạng"
+      });
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ message: "Mật khẩu phải từ 6 ký tự trở lên" });
+      return res.status(400).json({
+        field: "password",
+        message: "Mật khẩu phải từ 6 ký tự trở lên"
+      });
     }
 
-    const existingUser = await db.collection("users").findOne({
-      $or: [{ username }, { email }]
-    });
+    const existingUsername = await db.collection("users").findOne({ username });
+    if (existingUsername) {
+      return res.status(409).json({
+        field: "username",
+        message: "Tên đăng nhập đã tồn tại"
+      });
+    }
 
-    if (existingUser) {
-      return res.status(409).json({ message: "Username hoặc email đã tồn tại" });
+    const existingEmail = await db.collection("users").findOne({ email });
+    if (existingEmail) {
+      return res.status(409).json({
+        field: "email",
+        message: "Email đã tồn tại"
+      });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const result = await db.collection("users").insertOne({
-  username,
-  email,
-  password: hashedPassword,
-  role: "user",
-  balance: 0,
-  createdAt: new Date()
-});
+      username,
+      email,
+      password: hashedPassword,
+      role: "user",
+      balance: 0,
+      createdAt: new Date()
+    });
 
     res.status(201).json({
       message: "Đăng ký thành công",
@@ -95,10 +118,50 @@ app.post("/register", async (req, res) => {
     });
   } catch (error) {
     console.error("Lỗi /register:", error.message);
-    res.status(500).json({ message: "Lỗi server" });
+    res.status(500).json({
+      field: "general",
+      message: "Lỗi server"
+    });
   }
 });
+app.post("/register/check", async (req, res) => {
+  try {
+    const { username, email } = req.body;
 
+    if (username) {
+      const existingUsername = await db.collection("users").findOne({ username });
+      if (existingUsername) {
+        return res.json({
+          field: "username",
+          exists: true,
+          message: "Tên đăng nhập đã tồn tại"
+        });
+      }
+    }
+
+    if (email) {
+      const existingEmail = await db.collection("users").findOne({ email });
+      if (existingEmail) {
+        return res.json({
+          field: "email",
+          exists: true,
+          message: "Email đã tồn tại"
+        });
+      }
+    }
+
+    return res.json({
+      exists: false
+    });
+  } catch (error) {
+    console.error("Lỗi /register/check:", error.message);
+    return res.status(500).json({
+      field: "general",
+      exists: false,
+      message: "Lỗi server"
+    });
+  }
+});
 // ===================== LOGIN =====================
 app.post("/login", async (req, res) => {
   try {
@@ -534,7 +597,149 @@ app.delete("/products/:id", adminMiddleware, async (req, res) => {
     res.status(500).json({ message: "Lỗi xóa sản phẩm" });
   }
 });
+// ===================== MUA SẢN PHẨM BẰNG SỐ DƯ =====================
+app.post("/purchase/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "ID sản phẩm không hợp lệ" });
+    }
+
+    const productId = new ObjectId(id);
+
+    const product = await db.collection("products").findOne({ _id: productId });
+    if (!product) {
+      return res.status(404).json({ message: "Không tìm thấy sản phẩm" });
+    }
+
+    if (product.status === "sold") {
+      return res.status(400).json({ message: "Sản phẩm này đã bán" });
+    }
+
+    const user = await db.collection("users").findOne({
+      _id: new ObjectId(req.user.userId)
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: "Không tìm thấy người dùng" });
+    }
+
+    const price = Number(product.price || 0);
+    const balanceBefore = Number(user.balance || 0);
+
+    if (balanceBefore < price) {
+      return res.status(400).json({
+        message: "Số dư không đủ để mua sản phẩm",
+        balance: balanceBefore,
+        price
+      });
+    }
+
+    const productUpdate = await db.collection("products").updateOne(
+      { _id: productId, status: { $ne: "sold" } },
+      {
+        $set: {
+          status: "sold",
+          soldAt: new Date(),
+          buyerId: new ObjectId(req.user.userId),
+          buyerUsername: user.username
+        }
+      }
+    );
+
+    if (productUpdate.matchedCount === 0) {
+      return res.status(400).json({ message: "Sản phẩm vừa được người khác mua" });
+    }
+
+    const walletUpdate = await db.collection("users").updateOne(
+      {
+        _id: new ObjectId(req.user.userId),
+        balance: { $gte: price }
+      },
+      {
+        $inc: { balance: -price }
+      }
+    );
+
+    if (walletUpdate.matchedCount === 0) {
+      await db.collection("products").updateOne(
+        { _id: productId },
+        {
+          $set: { status: "available" },
+          $unset: {
+            soldAt: "",
+            buyerId: "",
+            buyerUsername: ""
+          }
+        }
+      );
+
+      return res.status(400).json({ message: "Số dư không đủ để mua sản phẩm" });
+    }
+
+    const updatedUser = await db.collection("users").findOne({
+      _id: new ObjectId(req.user.userId)
+    });
+
+    const balanceAfter = Number(updatedUser.balance || 0);
+
+    await db.collection("transactions").insertOne({
+      userId: new ObjectId(req.user.userId),
+      type: "purchase",
+      productId: product._id,
+      productTitle: product.title,
+      amount: price,
+      balanceBefore,
+      balanceAfter,
+      note: `Mua sản phẩm: ${product.title}`,
+      createdAt: new Date()
+    });
+
+    await db.collection("orders").insertOne({
+      userId: new ObjectId(req.user.userId),
+      username: user.username,
+      productId: product._id,
+      productTitle: product.title,
+      productPrice: price,
+      deliveryInfo: {
+        username: product.detail?.username || "",
+        category: product.detail?.category || "",
+        livestream: !!product.detail?.livestream,
+        shopEnabled: !!product.detail?.shopEnabled,
+        note: product.detail?.note || ""
+      },
+      status: "completed",
+      createdAt: new Date()
+    });
+
+    return res.json({
+      message: "Mua sản phẩm thành công",
+      product: {
+        id: product._id,
+        title: product.title,
+        price,
+        image: product.image,
+        follow: product.follow || 0,
+        desc: product.desc || ""
+      },
+      wallet: {
+        balanceBefore,
+        balanceAfter
+      },
+      deliveryInfo: {
+        username: product.detail?.username || "Chưa cập nhật",
+        category: product.detail?.category || "Chưa cập nhật",
+        livestream: !!product.detail?.livestream,
+        shopEnabled: !!product.detail?.shopEnabled,
+        note: product.detail?.note || "Không có ghi chú"
+      }
+    });
+  } catch (error) {
+    console.error("Lỗi /purchase/:id:", error.message);
+    return res.status(500).json({ message: "Lỗi xử lý mua sản phẩm" });
+  }
+});
 // ===================== RUN SERVER =====================
 connectDB().then(() => {
   app.listen(PORT, () => {
