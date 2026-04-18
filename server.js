@@ -1,3 +1,4 @@
+import nodemailer from "nodemailer";
 import { PayOS } from "@payos/node";
 import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
@@ -11,6 +12,12 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+const MAIL_HOST = process.env.MAIL_HOST;
+const MAIL_PORT = Number(process.env.MAIL_PORT || 587);
+const MAIL_SECURE = String(process.env.MAIL_SECURE || "false") === "true";
+const MAIL_USER = process.env.MAIL_USER;
+const MAIL_PASS = process.env.MAIL_PASS;
+const MAIL_FROM = process.env.MAIL_FROM || MAIL_USER;
 const PAYOS_CLIENT_ID = process.env.PAYOS_CLIENT_ID;
 const PAYOS_API_KEY = process.env.PAYOS_API_KEY;
 const PAYOS_CHECKSUM_KEY = process.env.PAYOS_CHECKSUM_KEY;
@@ -40,13 +47,35 @@ async function connectDB() {
 
     // products
     await db.collection("products").createIndex({ slug: 1 }, { unique: true });
-
+        await db.collection("pending_registers").createIndex({ email: 1 }, { unique: true });
+    await db.collection("pending_registers").createIndex({ username: 1 }, { unique: true });
+    await db.collection("pending_registers").createIndex(
+      { otpExpireAt: 1 },
+      { expireAfterSeconds: 0 }
+    );
     console.log("✅ Kết nối MongoDB thành công");
   } catch (error) {
     console.error("❌ Lỗi kết nối MongoDB:", error.message);
     process.exit(1);
   }
 }
+const mailTransporter =
+  MAIL_HOST && MAIL_USER && MAIL_PASS
+    ? nodemailer.createTransport({
+        host: MAIL_HOST,
+        port: MAIL_PORT,
+        secure: MAIL_SECURE,
+        auth: {
+          user: MAIL_USER,
+          pass: MAIL_PASS
+        }
+      })
+    : null;
+
+function generateOTP() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+//tao payos
 const payOS = new PayOS({
   clientId: PAYOS_CLIENT_ID,
   apiKey: PAYOS_API_KEY,
@@ -128,24 +157,28 @@ app.post("/register/check", async (req, res) => {
   try {
     const { username, email } = req.body;
 
-    if (username) {
+        if (username) {
       const existingUsername = await db.collection("users").findOne({ username });
-      if (existingUsername) {
+      const pendingUsername = await db.collection("pending_registers").findOne({ username });
+
+      if (existingUsername || pendingUsername) {
         return res.json({
           field: "username",
           exists: true,
-          message: "Tên đăng nhập đã tồn tại"
+          message: "Tên đăng nhập đã tồn tại hoặc đang chờ xác minh"
         });
       }
     }
 
-    if (email) {
+        if (email) {
       const existingEmail = await db.collection("users").findOne({ email });
-      if (existingEmail) {
+      const pendingEmail = await db.collection("pending_registers").findOne({ email });
+
+      if (existingEmail || pendingEmail) {
         return res.json({
           field: "email",
           exists: true,
-          message: "Email đã tồn tại"
+          message: "Email đã tồn tại hoặc đang chờ xác minh"
         });
       }
     }
@@ -162,16 +195,270 @@ app.post("/register/check", async (req, res) => {
     });
   }
 });
+//api moi gui mail dk
+app.post("/register/start", async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        field: "general",
+        message: "Vui lòng nhập đầy đủ thông tin"
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        field: "email",
+        message: "Email không đúng định dạng"
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        field: "password",
+        message: "Mật khẩu phải từ 6 ký tự trở lên"
+      });
+    }
+
+    const existingUsername = await db.collection("users").findOne({ username });
+    if (existingUsername) {
+      return res.status(409).json({
+        field: "username",
+        message: "Tên đăng nhập đã tồn tại"
+      });
+    }
+
+    const existingEmail = await db.collection("users").findOne({ email });
+    if (existingEmail) {
+      return res.status(409).json({
+        field: "email",
+        message: "Email đã tồn tại"
+      });
+    }
+
+    if (!mailTransporter) {
+      return res.status(500).json({
+        message: "Server chưa cấu hình gửi email"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const otp = generateOTP();
+    const otpExpireAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await db.collection("pending_registers").deleteMany({
+      $or: [{ email }, { username }]
+    });
+
+    const pendingResult = await db.collection("pending_registers").insertOne({
+  username,
+  email,
+  passwordHash,
+  otp,
+  otpExpireAt,
+  createdAt: new Date()
+});
+
+try {
+  await mailTransporter.sendMail({
+    from: MAIL_FROM,
+    to: email,
+    subject: "Mã xác minh đăng ký XD Store",
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6">
+        <h2>Mã xác minh đăng ký</h2>
+        <p>Mã OTP của bạn là:</p>
+        <div style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0b67d0">${otp}</div>
+        <p>Mã có hiệu lực trong 10 phút.</p>
+        <p>Nếu bạn không thực hiện đăng ký, hãy bỏ qua email này.</p>
+      </div>
+    `
+  });
+} catch (mailError) {
+  await db.collection("pending_registers").deleteOne({
+    _id: pendingResult.insertedId
+  });
+
+  console.error("Gửi mail lỗi:", mailError.message);
+
+  return res.status(500).json({
+    message: "Gửi email xác minh thất bại"
+  });
+}
+    return res.json({
+      message: "Đã gửi mã xác minh"
+    });
+  } catch (error) {
+    console.error("Lỗi /register/start:", error.message);
+    return res.status(500).json({
+      message: "Lỗi server"
+    });
+  }
+});
+
+app.post("/register/verify", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({
+        message: "Thiếu email hoặc mã OTP"
+      });
+    }
+
+    const pending = await db.collection("pending_registers").findOne({ email });
+
+    if (!pending) {
+      return res.status(400).json({
+        message: "Không tìm thấy yêu cầu đăng ký hoặc mã đã hết hạn"
+      });
+    }
+
+    if (pending.otp !== otp) {
+      return res.status(400).json({
+        message: "Mã OTP không đúng"
+      });
+    }
+
+    if (new Date() > new Date(pending.otpExpireAt)) {
+      await db.collection("pending_registers").deleteOne({ _id: pending._id });
+      return res.status(400).json({
+        message: "Mã OTP đã hết hạn"
+      });
+    }
+
+    const existingUsername = await db.collection("users").findOne({ username: pending.username });
+    if (existingUsername) {
+      return res.status(409).json({
+        message: "Tên đăng nhập đã tồn tại"
+      });
+    }
+
+    const existingEmail = await db.collection("users").findOne({ email: pending.email });
+    if (existingEmail) {
+      return res.status(409).json({
+        message: "Email đã tồn tại"
+      });
+    }
+
+    const result = await db.collection("users").insertOne({
+      username: pending.username,
+      email: pending.email,
+      password: pending.passwordHash,
+      role: "user",
+      balance: 0,
+      createdAt: new Date()
+    });
+
+    await db.collection("pending_registers").deleteOne({ _id: pending._id });
+
+    const token = jwt.sign(
+  {
+    userId: result.insertedId,
+    username: pending.username,
+    role: "user"
+  },
+  JWT_SECRET,
+  { expiresIn: "7d" }
+);
+
+return res.status(201).json({
+  message: "Đăng ký thành công",
+  token,
+  user: {
+    id: result.insertedId,
+    username: pending.username,
+    email: pending.email,
+    role: "user"
+  }
+});
+  } catch (error) {
+    console.error("Lỗi /register/verify:", error.message);
+    return res.status(500).json({
+      message: "Lỗi server"
+    });
+  }
+});
+
+app.post("/register/resend-otp", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Thiếu email" });
+    }
+
+    const pending = await db.collection("pending_registers").findOne({ email });
+
+    if (!pending) {
+      return res.status(404).json({
+        message: "Không tìm thấy yêu cầu đăng ký"
+      });
+    }
+
+    if (!mailTransporter) {
+      return res.status(500).json({
+        message: "Server chưa cấu hình gửi email"
+      });
+    }
+
+    const otp = generateOTP();
+    const otpExpireAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await db.collection("pending_registers").updateOne(
+      { _id: pending._id },
+      {
+        $set: {
+          otp,
+          otpExpireAt,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    await mailTransporter.sendMail({
+      from: MAIL_FROM,
+      to: email,
+      subject: "Mã xác minh đăng ký XD Store",
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6">
+          <h2>Gửi lại mã xác minh đăng ký</h2>
+          <p>Mã OTP mới của bạn là:</p>
+          <div style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0b67d0">${otp}</div>
+          <p>Mã có hiệu lực trong 10 phút.</p>
+        </div>
+      `
+    });
+
+    return res.json({
+      message: "Đã gửi lại mã OTP"
+    });
+  } catch (error) {
+    console.error("Lỗi /register/resend-otp:", error.message);
+    return res.status(500).json({
+      message: "Lỗi server"
+    });
+  }
+});
 // ===================== LOGIN =====================
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
-      return res.status(400).json({ message: "Vui lòng nhập username và password" });
-    }
+if (!username || !password) {
+  return res.status(400).json({ message: "Vui lòng nhập tên đăng nhập hoặc email và mật khẩu" });
+}
 
-    const user = await db.collection("users").findOne({ username });
+const loginValue = username.trim().toLowerCase();
+
+const user = await db.collection("users").findOne(
+  loginValue.includes("@")
+    ? { email: loginValue }
+    : { username: username.trim() }
+);
 
     if (!user) {
       return res.status(401).json({ message: "Tài khoản không tồn tại" });
@@ -230,7 +517,187 @@ function adminMiddleware(req, res, next) {
     return res.status(401).json({ message: "Token không hợp lệ" });
   }
 }
+// ===================== Quen mat khau =====================
+app.post("/change-password", authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword, confirmPassword } = req.body;
 
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ message: "Vui lòng nhập đầy đủ thông tin" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "Mật khẩu mới phải có ít nhất 6 ký tự" });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "Mật khẩu mới không khớp" });
+    }
+
+    const user = await db.collection("users").findOne({
+      _id: new ObjectId(req.user.userId)
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: "Không tìm thấy người dùng" });
+    }
+
+    if (!user.password) {
+      return res.status(400).json({
+        message: "Tài khoản này không có mật khẩu thường để đổi"
+      });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: "Mật khẩu hiện tại không đúng" });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await db.collection("users").updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          password: hashedPassword,
+          passwordUpdatedAt: new Date()
+        }
+      }
+    );
+
+    return res.json({ message: "Đổi mật khẩu thành công" });
+  } catch (error) {
+    console.error("Lỗi /change-password:", error.message);
+    return res.status(500).json({ message: "Lỗi server" });
+  }
+});
+
+app.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Vui lòng nhập email" });
+    }
+
+    const user = await db.collection("users").findOne({ email });
+
+    if (!user) {
+      return res.json({
+        message: "Nếu email tồn tại, mã xác minh đã được gửi"
+      });
+    }
+
+    if (!mailTransporter) {
+      return res.status(500).json({
+        message: "Server chưa cấu hình gửi email"
+      });
+    }
+
+    const otp = generateOTP();
+    const otpExpireAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await db.collection("users").updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          resetOtp: otp,
+          resetOtpExpireAt: otpExpireAt,
+          resetOtpCreatedAt: new Date()
+        }
+      }
+    );
+
+    await mailTransporter.sendMail({
+      from: MAIL_FROM,
+      to: email,
+      subject: "Mã đặt lại mật khẩu XD Store",
+      html: `
+        <div style="font-family:Arial,sans-serif;line-height:1.6">
+          <h2>Đặt lại mật khẩu</h2>
+          <p>Mã OTP đặt lại mật khẩu của bạn là:</p>
+          <div style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0b67d0">${otp}</div>
+          <p>Mã có hiệu lực trong 10 phút.</p>
+          <p>Nếu bạn không yêu cầu đặt lại mật khẩu, hãy bỏ qua email này.</p>
+        </div>
+      `
+    });
+
+    return res.json({
+      message: "Nếu email tồn tại, mã xác minh đã được gửi"
+    });
+  } catch (error) {
+    console.error("Lỗi /forgot-password:", error.message);
+    return res.status(500).json({ message: "Lỗi server" });
+  }
+});
+
+app.post("/reset-password", async (req, res) => {
+  try {
+    const { email, otp, newPassword, confirmPassword } = req.body;
+
+    if (!email || !otp || !newPassword || !confirmPassword) {
+      return res.status(400).json({ message: "Vui lòng nhập đầy đủ thông tin" });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "Mật khẩu mới phải có ít nhất 6 ký tự" });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "Mật khẩu mới không khớp" });
+    }
+
+    const user = await db.collection("users").findOne({ email });
+
+    if (!user || !user.resetOtp || !user.resetOtpExpireAt) {
+      return res.status(400).json({
+        message: "Yêu cầu đặt lại mật khẩu không hợp lệ hoặc đã hết hạn"
+      });
+    }
+
+    if (user.resetOtp !== otp) {
+      return res.status(400).json({ message: "Mã OTP không đúng" });
+    }
+
+    if (new Date() > new Date(user.resetOtpExpireAt)) {
+      await db.collection("users").updateOne(
+        { _id: user._id },
+        {
+          $unset: {
+            resetOtp: "",
+            resetOtpExpireAt: "",
+            resetOtpCreatedAt: ""
+          }
+        }
+      );
+
+      return res.status(400).json({ message: "Mã OTP đã hết hạn" });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await db.collection("users").updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          password: hashedPassword,
+          passwordUpdatedAt: new Date()
+        },
+        $unset: {
+          resetOtp: "",
+          resetOtpExpireAt: "",
+          resetOtpCreatedAt: ""
+        }
+      }
+    );
+
+    return res.json({ message: "Đặt lại mật khẩu thành công" });
+  } catch (error) {
+    console.error("Lỗi /reset-password:", error.message);
+    return res.status(500).json({ message: "Lỗi server" });
+  }
+});
 // ===================== AUTH MIDDLEWARE =====================
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
